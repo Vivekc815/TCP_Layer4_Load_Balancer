@@ -5,16 +5,23 @@
 #include <cstdio>
 #include <sys/epoll.h>
 #include <unordered_map>
-
+#include <fcntl.h>
+#include <cerrno>
 
 
 
 
 char buffer[1024];
 
+void set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 int main(){
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { perror("socket"); return 1; }
+    set_nonblocking(server_fd);
 
 
     sockaddr_in address{};
@@ -62,6 +69,8 @@ int main(){
             if(fd == server_fd){
                 int client_fd = accept(server_fd, nullptr, nullptr);
                 if (client_fd < 0) { perror("accept"); continue; }
+
+                set_nonblocking(client_fd);
                 printf("new client: fd %d\n", client_fd);
 
 
@@ -85,6 +94,8 @@ int main(){
                     close(client_fd);
                     continue;
                 }
+                set_nonblocking(backend_fd);
+
 
                 epoll_event bev{};
                 bev.events = EPOLLIN;
@@ -108,6 +119,7 @@ int main(){
                 ssize_t r = read(fd, buf, sizeof(buf));
                 int other = partner[fd];
                 if (r <= 0) {
+                    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;   // nothing to read right now → skip
                     // 0 = client disconnected, -1 = error → clean up
                     printf("fd %d closed, closing partner %d\n", fd, other);
                     close(fd);
