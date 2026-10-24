@@ -4,20 +4,22 @@
 #include <unistd.h>
 #include <cstdio>
 #include <sys/epoll.h>
-
+#include <cstdlib>
 
 
 
 char buffer[1024];
 
-int main(){
+int main(int argc, char* argv[]){
+    int port = 9000;
+    if (argc > 1) port = atoi(argv[1]);
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { perror("socket"); return 1; }
 
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_port = htons(9000);
+    address.sin_port = htons(port);
     address.sin_addr.s_addr = htonl(INADDR_ANY);
 
     int opt = 1;
@@ -73,6 +75,7 @@ int main(){
             } else{
                 // EXISTING CLIENT SENT DATA
                 char buf[1024];
+                char reply[1100];
                 ssize_t r = read(fd, buf, sizeof(buf));
 
                 if (r <= 0) {
@@ -80,7 +83,8 @@ int main(){
                     printf("client fd %d disconnected\n", fd);
                     close(fd);
                 } else {
-                    write(fd, buf, r);   // echo back
+                    int len = snprintf(reply, sizeof(reply), "[%d] %.*s", port, (int)r, buf);
+                    write(fd, reply, len);   // echo back
                 }
             }
         }

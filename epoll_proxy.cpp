@@ -14,6 +14,9 @@
 
 char buffer[1024];
 std::unordered_set<int> connecting; 
+int backend_ports[] = {9001, 9002, 9003, 9004, 9005};
+int num_backends = 5;
+int next_backend = 0;   
 
 void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -94,9 +97,11 @@ int main(){
                 }
                 int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
                 if (backend_fd < 0) { perror("socket"); close(client_fd); continue; }
+                int port = backend_ports[next_backend];
+                next_backend = (next_backend+1)%num_backends;
                 sockaddr_in backend_addr{};
                 backend_addr.sin_family = AF_INET;
-                backend_addr.sin_port   = htons(9000);
+                backend_addr.sin_port   = htons(port);
                 inet_pton(AF_INET, "127.0.0.1", &backend_addr.sin_addr);
                 set_nonblocking(backend_fd);
                 if (connect(backend_fd, (struct sockaddr *)&backend_addr, sizeof(backend_addr)) < 0 && errno != EINPROGRESS) {
@@ -165,7 +170,7 @@ int main(){
                     pending.erase(fd);
                     pending.erase(other);
                     connecting.erase(fd);
-connecting.erase(other);
+                    connecting.erase(other);
                     continue;
                 }
                 if (w > 0) note.erase(0, w);
@@ -191,7 +196,7 @@ connecting.erase(other);
                     pending.erase(fd);
                     pending.erase(other);
                     connecting.erase(fd);
-connecting.erase(other);
+                    connecting.erase(other);
                 } else {
                     ssize_t w = write(other, buf, r);
                     if(w<0){
@@ -207,7 +212,7 @@ connecting.erase(other);
                         pending.erase(fd);            // remove both from the map
                         pending.erase(other);
                         connecting.erase(fd);
-connecting.erase(other);
+                        connecting.erase(other);
                         continue;
 
                     }
