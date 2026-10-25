@@ -10,13 +10,55 @@
 #include <string>
 #include <unordered_set>
 #include <cstring>
+#include <map>
+#include <functional>
 
 
 char buffer[1024];
 std::unordered_set<int> connecting; 
+std::unordered_map<int, int> partner;   // fd → its partner fdho
+std::unordered_map<int, std::string> pending;
+std::map<uint32_t, int> ring;            // position on the clock → backend index
 int backend_ports[] = {9001, 9002, 9003, 9004, 9005};
 int num_backends = 5;
-int next_backend = 0;   
+int next_backend = 0; 
+int active_conns[5] = {0};  
+std::unordered_map<int, int> backend_of;   
+
+
+void build_ring(){
+    for(int b=0; b<num_backends; b++){
+        for(int v = 0; v<100; v++){
+            std::string key = std::to_string(backend_ports[b]) + "#" + std::to_string(v);
+            uint32_t pos = std::hash<std::string>{}(key);
+            ring[pos] = b;
+        }
+    }
+}
+
+int pick_hash(uint32_t client_ip){
+    uint32_t pos = std::hash<std::string>{}(std::to_string(client_ip));
+    auto it = ring.lower_bound(pos);
+    if(it == ring.end()) it = ring.begin();
+    return it-> second;
+}
+
+void close_pair(int fd) {
+    if (backend_of.count(fd))    { active_conns[backend_of[fd]]--;    backend_of.erase(fd); }
+    int other = partner[fd]; 
+    if (backend_of.count(other)) { active_conns[backend_of[other]]--; backend_of.erase(other); }
+               // look up the partner BEFORE erasing
+    printf("closing %d and %d\n", fd, other);
+    close(fd);
+    close(other);
+    partner.erase(fd);
+    partner.erase(other);
+    pending.erase(fd);
+    pending.erase(other);
+    connecting.erase(fd);
+    connecting.erase(other);
+}
+
 
 void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -30,7 +72,30 @@ void watch(int epfd, int fd, uint32_t events){
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &e);
 }
 
-int main(){
+int pick_round_robin(){
+    int idx = next_backend;
+    next_backend = (next_backend + 1) % num_backends;
+    return idx;
+}
+
+int pick_least_conn(){
+    int best = 0;
+    for(int b = 1; b< num_backends; b++){
+        if(active_conns[b]< active_conns[best]){
+            best = b;
+        }
+        
+    }
+    return best;
+}
+
+int main(int argc, char* argv[]){
+    std::string mode = "rr";
+    if (argc > 1) mode = argv[1];
+    printf("load balancing mode: %s\n", mode.c_str());
+
+
+    
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { perror("socket"); return 1; }
     set_nonblocking(server_fd);
@@ -70,8 +135,8 @@ int main(){
     printf("server_fd added to epoll\n");
 
     epoll_event events[64];
-    std::unordered_map<int, int> partner;   // fd → its partner fdho
-    std::unordered_map<int, std::string> pending;
+    build_ring();
+    
     while (true){
         int n = epoll_wait(epfd, events, 64, -1);
         if (n<0){ perror("epoll_wait"); continue;}
@@ -80,9 +145,10 @@ int main(){
             int fd = events[i].data.fd;
 
             if(fd == server_fd){
-                int client_fd = accept(server_fd, nullptr, nullptr);
+                sockaddr_in client_addr{};
+                socklen_t addr_len = sizeof(client_addr);
+                int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &addr_len);
                 if (client_fd < 0) { perror("accept"); continue; }
-
                 set_nonblocking(client_fd);
                 printf("new client: fd %d\n", client_fd);
 
@@ -97,8 +163,12 @@ int main(){
                 }
                 int backend_fd = socket(AF_INET, SOCK_STREAM, 0);
                 if (backend_fd < 0) { perror("socket"); close(client_fd); continue; }
-                int port = backend_ports[next_backend];
-                next_backend = (next_backend+1)%num_backends;
+                int idx;
+                if (mode == "lc")        idx = pick_least_conn();
+                else if (mode == "hash") idx = pick_hash(client_addr.sin_addr.s_addr);
+                else                     idx = pick_round_robin();
+                int port = backend_ports[idx];
+                printf("client %d -> backend %d (port %d)\n", client_fd, idx, port);
                 sockaddr_in backend_addr{};
                 backend_addr.sin_family = AF_INET;
                 backend_addr.sin_port   = htons(port);
@@ -126,6 +196,8 @@ int main(){
                 partner[client_fd] = backend_fd;
                 partner[backend_fd] = client_fd;
                 connecting.insert(backend_fd);
+                backend_of[backend_fd] = idx;
+                active_conns[idx]++;
                 printf("paired client %d <-> backend %d\n", client_fd, backend_fd);
             } 
             
@@ -142,15 +214,8 @@ int main(){
                     if (err != 0) {
                         printf("backend connect failed: %s\n", strerror(err));
                         // close both + erase from partner and pending
-                        close(fd);
-                    close(other);
-                    partner.erase(fd);            // remove both from the map
-                    partner.erase(other);
-                    pending.erase(fd);
-                    pending.erase(other);
-                    
-                    continue;
-                    
+                        close_pair(fd);
+                        continue;                    
                     }
                     watch(epfd, fd, EPOLLIN);       // backend: normal
                     watch(epfd, other, EPOLLIN);    // client: start listening now
@@ -162,15 +227,7 @@ int main(){
                     std::string &note = pending[fd];
                     ssize_t w = write(fd, note.data(), note.size());   
                     if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                    int other = partner[fd];  
-                    close(fd);
-                    close(other);
-                    partner.erase(fd);            // remove both from the map
-                    partner.erase(other);
-                    pending.erase(fd);
-                    pending.erase(other);
-                    connecting.erase(fd);
-                    connecting.erase(other);
+                    close_pair(fd);
                     continue;
                 }
                 if (w > 0) note.erase(0, w);
@@ -184,35 +241,22 @@ int main(){
 
                 char buf[1024];
                 ssize_t r = read(fd, buf, sizeof(buf));
-                int other = partner[fd];
+                int other = partner[fd];                
                 if (r <= 0) {
                     if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;   // nothing to read right now → skipnj
                     // 0 = client disconnected, -1 = error → clean up
                     printf("fd %d closed, closing partner %d\n", fd, other);
-                    close(fd);
-                    close(other);
-                    partner.erase(fd);            // remove both from the map
-                    partner.erase(other);
-                    pending.erase(fd);
-                    pending.erase(other);
-                    connecting.erase(fd);
-                    connecting.erase(other);
+                    close_pair(fd);
+                    continue;
                 } else {
                     ssize_t w = write(other, buf, r);
                     if(w<0){
-                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
                         w = 0;    
 
                     }  
                     else{
-                        close(fd);
-                        close(other);
-                        partner.erase(fd);            // remove both from the map
-                        partner.erase(other);
-                        pending.erase(fd);            // remove both from the map
-                        pending.erase(other);
-                        connecting.erase(fd);
-                        connecting.erase(other);
+                        close_pair(fd);
                         continue;
 
                     }
