@@ -12,6 +12,8 @@
 #include <cstring>
 #include <map>
 #include <functional>
+#include <sys/timerfd.h>
+
 
 
 char buffer[1024];
@@ -24,6 +26,10 @@ int num_backends = 5;
 int next_backend = 0; 
 int active_conns[5] = {0};  
 std::unordered_map<int, int> backend_of;   
+bool healthy[5] = {true, true, true, true, true};
+int fail_count[5] = {0};
+int ok_count[5] = {0};
+std::unordered_map<int, int> probe_of;
 
 
 void build_ring(){
@@ -36,12 +42,17 @@ void build_ring(){
     }
 }
 
-int pick_hash(uint32_t client_ip){
+int pick_hash(uint32_t client_ip) {
     uint32_t pos = std::hash<std::string>{}(std::to_string(client_ip));
     auto it = ring.lower_bound(pos);
-    if(it == ring.end()) it = ring.begin();
-    return it-> second;
+    for (size_t k = 0; k < ring.size(); k++) {
+        if (it == ring.end()) it = ring.begin();
+        if (healthy[it->second]) return it->second;
+        ++it;
+    }
+    return -1;
 }
+
 
 void close_pair(int fd) {
     if (backend_of.count(fd))    { active_conns[backend_of[fd]]--;    backend_of.erase(fd); }
@@ -72,22 +83,44 @@ void watch(int epfd, int fd, uint32_t events){
     epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &e);
 }
 
-int pick_round_robin(){
-    int idx = next_backend;
-    next_backend = (next_backend + 1) % num_backends;
-    return idx;
+int pick_round_robin() {
+    for (int tries = 0; tries < num_backends; tries++) {
+        int idx = next_backend;
+        next_backend = (next_backend + 1) % num_backends;
+        if (healthy[idx]) return idx;
+    }
+    return -1;
 }
 
-int pick_least_conn(){
-    int best = 0;
-    for(int b = 1; b< num_backends; b++){
-        if(active_conns[b]< active_conns[best]){
-            best = b;
+
+void record_result(int b, bool ok){
+    if (ok){
+        fail_count[b] = 0;
+        ok_count[b]++;
+        if(!healthy[b] && ok_count[b] >= 2){
+            healthy[b] = true;
+            printf("backend %d UP\n", backend_ports[b]); 
         }
-        
+    }
+    else{
+        ok_count[b] = 0;
+        fail_count[b]++;
+        if(healthy[b] && fail_count[b] >= 3){
+            healthy[b] = false;
+            printf("backend %d DOWN\n", backend_ports[b]);
+        }
+    }
+}
+
+int pick_least_conn() {
+    int best = -1;
+    for (int b = 0; b < num_backends; b++) {
+        if (!healthy[b]) continue;
+        if (best == -1 || active_conns[b] < active_conns[best]) best = b;
     }
     return best;
 }
+
 
 int main(int argc, char* argv[]){
     std::string mode = "rr";
@@ -136,13 +169,75 @@ int main(int argc, char* argv[]){
 
     epoll_event events[64];
     build_ring();
+    int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);   // create the alarm clock
+    if (tfd < 0) { perror("timerfd_create"); return 1; }
+
+    itimerspec spec{};
+    spec.it_value.tv_sec = 1;       // first ring after 1 second
+    spec.it_interval.tv_sec = 1;    // then every 1 second
+    timerfd_settime(tfd, 0, &spec, nullptr);  
+    epoll_event tev{};
+    tev.events = EPOLLIN;
+    tev.data.fd = tfd;
     
+    if(epoll_ctl(epfd, EPOLL_CTL_ADD, tfd, &tev)<0){
+        perror("epoll_ctl");
+        return 1;
+    }  
     while (true){
         int n = epoll_wait(epfd, events, 64, -1);
         if (n<0){ perror("epoll_wait"); continue;}
 
         for(int i=0; i<n; i++){
             int fd = events[i].data.fd;
+
+            if (fd == tfd) {
+                uint64_t ticks;
+                read(tfd, &ticks, sizeof(ticks));     // clear the alarm
+                for(auto &p : probe_of){
+                    record_result(p.second, false);
+                    close(p.first);
+                } 
+                probe_of.clear();
+
+                for(int b=0; b<num_backends; b++){
+                    int pfd = socket(AF_INET, SOCK_STREAM,0);
+                    if(pfd<0) continue;
+                    set_nonblocking(pfd);
+
+                    sockaddr_in a{};
+                    a.sin_family = AF_INET;
+                    a.sin_port = htons(backend_ports[b]);
+                    inet_pton(AF_INET, "127.0.0.1", &a.sin_addr);
+
+                    int rc = connect(pfd, (struct sockaddr *)&a, sizeof(a));
+                    if (rc == 0)                 { record_result(b, true);  close(pfd); continue; }  // connected instantly
+                    if (errno != EINPROGRESS)    { record_result(b, false); close(pfd); continue; }  // refused instantly
+
+
+                    epoll_event pe{};
+                    pe.events = EPOLLOUT;
+                    pe.data.fd = pfd;
+                    epoll_ctl(epfd, EPOLL_CTL_ADD, pfd, &pe);
+                    probe_of[pfd] = b;
+
+
+                    
+                    
+
+                }
+
+                continue;
+            }
+            if(probe_of.count(fd)){
+                        int err = 0;
+                        socklen_t len = sizeof(err);
+                        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+                        record_result(probe_of[fd], err == 0);
+                        probe_of.erase(fd);
+                        close(fd);
+                        continue;
+                    }
 
             if(fd == server_fd){
                 sockaddr_in client_addr{};
@@ -167,6 +262,12 @@ int main(int argc, char* argv[]){
                 if (mode == "lc")        idx = pick_least_conn();
                 else if (mode == "hash") idx = pick_hash(client_addr.sin_addr.s_addr);
                 else                     idx = pick_round_robin();
+                if (idx < 0) {
+                    printf("no healthy backends!\n");
+                    close(backend_fd);
+                    close(client_fd);
+                    continue;
+                }
                 int port = backend_ports[idx];
                 printf("client %d -> backend %d (port %d)\n", client_fd, idx, port);
                 sockaddr_in backend_addr{};
